@@ -4,7 +4,7 @@ import json
 import re
 import logging
 import base64
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from PIL import Image
@@ -43,6 +43,23 @@ DAYBOOK_SHEET_OUTPUT_STRUCTURE = '''
   }
 }
 '''
+
+DAY_FIELDS = [
+    "Sale in cash and UPI",
+    "Sale on credit",
+    "Cash received from customers",
+    "Buy raw material in cash and UPI",
+    "Buy raw material on credit",
+    "Cash paid to suppliers",
+    "Cash paid for transportation",
+    "Salary / Wages paid to Workers",
+    "Salary / Wages paid by Owners",
+    "Electricity, water and fuel cost",
+    "Rent paid",
+    "Repayment of loan",
+    "Other income",
+    "Other costs"
+]
 
 PT_SHEET_OLD_OUTPUT_STRUCTURE = '''
 {
@@ -206,6 +223,72 @@ Remember:
 Now, proceed with your examination and data extraction from the provided enterprise financial document image.
 """
 
+BASE_SYSTEM_MESSAGE_FOR_DAYBOOK = f"""
+You are a high-precision financial data extraction AI. Your task is to digitize "Daybook" images into structured JSON with MINIMAL output size.
+
+### INPUT CONTEXT
+You will receive an image of a pre-printed financial form.
+* **Layout:** The document is a grid table. Rows (Vertical) = Days (1-31). Columns (Horizontal) = Categories.
+* **Language:** Headers are bilingual (English/Odia). Use the English text.
+
+### OUTPUT SCHEMA
+Extract data strictly according to the following JSON structure.
+**Critical:** The schema below defines the structure for a single day. You must generate keys for every day present in the image that contains data.
+
+<output_structure>
+{{OUTPUT_STRUCTURE}}
+</output_structure>
+
+### EXTRACTION INSTRUCTIONS
+1.  **Anchors:** Locate Enterprise ID (Top Left) and Month (Top Right).
+2.  **Grid Traversal:** Scan the leftmost column (Day 1-31). For every row with handwritten data, create a "Day X" key.
+3.  **Data Type:** Extract integers only from cells with visible handwritten numbers.
+4.  **CRITICAL OUTPUT RULE - SPARSE JSON (MANDATORY):**
+    - ONLY output fields that contain actual numerical data
+    - NEVER output a field if the cell is blank, empty, illegible, contains a dash (-), or has no written value
+    - NEVER include null values in your output - completely omit the field instead
+    - NEVER include fields with null, None, or empty values - omit them entirely
+    - Each "Day X" object should ONLY contain the 2-5 fields that actually have data
+    - DO NOT include all 14 fields for each day - only include fields with actual values
+    - This is NOT optional - sparse output is mandatory to reduce token usage
+    - If you include null values, your output is INCORRECT
+5.  **Formatting:** Output ONLY valid JSON with no markdown, no comments, no explanations.
+
+### CORRECT OUTPUT EXAMPLE
+If Day 1 has values in only 2 cells and Day 2 has values in only 3 cells:
+
+{{
+  "Daybook Record": {{
+    "Enterprise ID": "ABC123",
+    "Month": "Jan 25",
+    "Day 1": {{
+      "Sale in cash and UPI": 500,
+      "Rent paid": 200
+    }},
+    "Day 2": {{
+      "Sale in cash and UPI": 300,
+      "Buy raw material in cash and UPI": 150,
+      "Other costs": 50
+    }}
+  }}
+}}
+
+### INCORRECT OUTPUT (DO NOT DO THIS)
+{{
+  "Daybook Record": {{
+    "Enterprise ID": "ABC123",
+    "Month": "Jan 25",
+    "Day 1": {{
+      "Sale in cash and UPI": 500,
+      "Sale on credit": null,
+      "Cash received from customers": null,
+      ...ALL OTHER FIELDS AS NULL...
+      "Rent paid": 200
+    }}
+  }}
+}}
+"""
+
 # Initialize environment variables
 load_dotenv()
 
@@ -367,6 +450,51 @@ class ImageProcessor:
         self.model_type = model_type.lower()
         self.gemini_model = gemini_model
         self.json_corrector = JsonCorrector()
+        
+    async def fill_missing_fields(self, daybook_response: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Post-processing for Daybook:
+        1. Ensure all days 1–31 are present
+        2. Ensure all DAY_FIELDS exist for each day
+        3. Preserve non-day keys (Month, Year, Enterprise ID, etc.)
+        4. Maintain exact DAY_FIELDS order
+        """
+
+        if not isinstance(daybook_response, dict):
+            return daybook_response
+
+        if "Daybook Record" not in daybook_response:
+            return daybook_response
+
+        record = daybook_response["Daybook Record"]
+
+        # New ordered record
+        new_record = {}
+
+        # Preserve non-day keys
+        for key, value in record.items():
+            if not key.startswith("Day"):
+                new_record[key] = value
+
+        # Ensure Day 1 to Day 31
+        for day_num in range(1, 32):
+            day_key = f"Day {day_num}"
+
+            if day_key in record and isinstance(record[day_key], dict):
+                day_data = record[day_key]
+                ordered_day_data = {}
+
+                # Ensure all DAY_FIELDS exist and are ordered
+                for field in DAY_FIELDS:
+                    ordered_day_data[field] = day_data.get(field, None)
+
+                new_record[day_key] = ordered_day_data
+            else:
+                # Missing day → fill with None fields
+                new_record[day_key] = {field: None for field in DAY_FIELDS}
+
+        daybook_response["Daybook Record"] = new_record
+        return daybook_response
 
     async def process_with_gemini(self, image_data: bytes, system_message: str) -> Dict:
         """Process an image with Gemini model."""
@@ -396,26 +524,41 @@ class ImageProcessor:
             error_msg = f"Error processing image with Gemini: {str(e)}"
             logging.error(error_msg)
             return {"error": error_msg}
-
+    
     async def process_single_image(self, image_data: bytes, document_type: Optional[str] = None) -> Dict:
-        """Process a single image using the configured model."""
+        """Process a single image using the configured model."""        
         try:
-            # Get the appropriate output structure based on document type
             output_structure = None
-            if document_type:
-                if document_type in DOCUMENT_CONFIG:
-                    output_structure = DOCUMENT_CONFIG[document_type]["output_structure"]
-                else:
-                    raise ValueError(f"Invalid document type. Supported types are: {list(DOCUMENT_CONFIG.keys())}")
 
-            # Prepare system message
+            if document_type:
+                if document_type not in DOCUMENT_CONFIG:
+                    raise ValueError(
+                        f"Invalid document type. Supported types are: {list(DOCUMENT_CONFIG.keys())}"
+                    )
+                output_structure = DOCUMENT_CONFIG[document_type]["output_structure"]
+
+            # 🔹 DEFAULT system message
             system_message = BASE_SYSTEM_MESSAGE_COMMON
-            if output_structure:
-                system_message = system_message.replace("{{OUTPUT_STRUCTURE}}", output_structure)
+
+            # 🔹 CONDITION: If Daybook → use Daybook-specific system message
+            if document_type == "Daybook":
+                system_message = BASE_SYSTEM_MESSAGE_FOR_DAYBOOK
+            else:
+                if output_structure:
+                    system_message = system_message.replace(
+                        "{{OUTPUT_STRUCTURE}}",
+                        output_structure
+                    )
 
             # Process with Gemini
-            return await self.process_with_gemini(image_data, system_message)
+            result = await self.process_with_gemini(image_data, system_message)
 
+            #  Apply fill_missing_fields ONLY for Daybook
+            if document_type == "Daybook" and isinstance(result, dict):
+                result = await self.fill_missing_fields(result)
+
+            return result
+        
         except Exception as e:
             error_msg = f"Error processing image: {str(e)}"
             logging.error(error_msg)
@@ -427,7 +570,7 @@ image_processor = ImageProcessor()
 @app.post("/process-image/")
 async def process_image(
     file: UploadFile = File(...), 
-    document_type: Optional[str] = None
+    document_type: Optional[str] = Form(None)
 ):
     """
     Process an uploaded image and extract information based on document type.
